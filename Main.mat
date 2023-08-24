@@ -1,0 +1,155 @@
+% Path to the data folder
+data_path = ‘/your path';
+
+% List all patient folders
+patient_folders = dir(fullfile(data_path, 'Patient *'));
+
+% Prepare empty arrays to store the aggregated data
+all_RML = [];
+all_ECG = [];
+
+% Load the data for each patient
+for patient_num = 1:length(patient_folders)
+    % Extract patient number from folder name
+    actual_patient_number = str2double(regexp(patient_folders(patient_num).name, '\d+', 'match', 'once'));
+    
+    rml_file = fullfile(data_path, patient_folders(patient_num).name, sprintf('Patient%d RML Corrected.csv', actual_patient_number));
+    ecg_file = fullfile(data_path, patient_folders(patient_num).name, sprintf('Patient%d ECG Corrected.csv', actual_patient_number));
+
+    rml_data = readtable(rml_file);
+    ecg_data = readtable(ecg_file);
+
+    all_RML = [all_RML; table2array(rml_data)];
+    all_ECG = [all_ECG; table2array(ecg_data)];
+end
+
+% Prepare the RML data
+RML = all_RML(:, 1:3);
+
+% Prepare the ECG data
+ECG = all_ECG;
+
+% Shift the RML data so that the minimum value is just above zero (adding 1 for safety)
+RML = RML - min(RML(:)) + 1;
+
+% Apply a log transformation to the shifted RML data
+RML_log = log(RML);
+
+% Create a 5-fold cross-validation object
+cv = cvpartition(size(RML_log, 1), 'KFold', 5);
+k = cv.NumTestSets;
+
+% For storing metrics for each fold and RML channel
+r2_values = zeros(k, 3);
+mse_values = zeros(k, 3);
+mae_values = zeros(k, 3);
+rmse_values = zeros(k, 3);
+coefficients = cell(3,1);
+
+% Define a set of lambda values for hyperparameter tuning
+lambdas = [0.01, 0.15, 0.20, 0.30, 0.75, 0.85, 1];
+
+% Run 5-fold cross-validation
+for rml_channel = 1:3
+    best_lambda = 0;
+    best_mse = inf;
+    
+    for lambda = lambdas
+        temp_mse = zeros(k, 1);
+        for i = 1:k
+            train_idx = cv.training(i);
+            validation_idx = cv.test(i);
+            
+            train_ECG = ECG(train_idx, :);
+            validation_ECG = ECG(validation_idx, :);
+            
+            train_RML = RML(train_idx, rml_channel);
+            validation_RML = RML(validation_idx, rml_channel);
+            
+            % Use Ridge Regression with a regularization parameter
+            mdl = fitrlinear(train_ECG, train_RML, 'Regularization','ridge', 'Lambda', lambda);
+            
+            % Predict on the validation data
+            predicted_RML = predict(mdl, validation_ECG);
+            
+            % Compute MSE for hyperparameter tuning
+            temp_mse(i) = mean((validation_RML - predicted_RML).^2);
+        end
+        if mean(temp_mse) < best_mse
+            best_mse = mean(temp_mse);
+            best_lambda = lambda;
+        end
+    end
+    
+    for i = 1:k
+        train_idx = cv.training(i);
+        validation_idx = cv.test(i);
+        
+        train_ECG = ECG(train_idx, :);
+        validation_ECG = ECG(validation_idx, :);
+        
+        train_RML = RML(train_idx, rml_channel);
+        validation_RML = RML(validation_idx, rml_channel);
+        
+        % Use Ridge Regression with the best lambda value
+        mdl = fitrlinear(train_ECG, train_RML, 'Regularization','ridge', 'Lambda', best_lambda);
+        
+        % Store the coefficients
+        coefficients{rml_channel} = mdl.Beta;
+        
+        % Predict on the validation data
+        predicted_RML = predict(mdl, validation_ECG);
+        
+        % Compute and store the metrics
+        r2_values(i, rml_channel) = corr(predicted_RML, validation_RML).^2;
+        mse_values(i, rml_channel) = mean((predicted_RML - validation_RML).^2);
+        mae_values(i, rml_channel) = mean(abs(predicted_RML - validation_RML));
+        rmse_values(i, rml_channel) = sqrt(mse_values(i, rml_channel));
+    end
+end
+
+% Analyze the residuals
+residuals = validation_RML - predicted_RML;
+
+% Plot histogram of residuals
+figure;
+histogram(residuals, 30);
+xlabel('Residuals');
+ylabel('Frequency');
+title('Histogram of Residuals');
+
+% Check for normality of residuals
+[h,p] = adtest(residuals);
+if h == 1
+    disp('The residuals are not normally distributed (p-value < 0.05)');
+else
+    disp('The residuals are normally distributed (p-value >= 0.05)');
+end
+
+% Display the p-value
+disp(['p-value: ', num2str(p)]);
+
+% Ensure residuals are positive for Box-Cox transformation
+min_residual = min(residuals);
+shifted_residuals = residuals - min_residual + 1;
+
+% Apply Box-Cox transformation
+[transformed_residuals, lambda] = boxcox(shifted_residuals);
+
+% Test for normality on the transformed residuals
+[h, p] = adtest(transformed_residuals);
+disp(['P-value for RML channel ', num2str(rml_channel), ': ', num2str(p)]);
+
+% Plot histogram of transformed residuals with fitted normal distribution
+figure;
+histogram(transformed_residuals, 30, 'Normalization', 'pdf');
+hold on;
+pd = fitdist(transformed_residuals, 'Normal');
+x = linspace(min(transformed_residuals), max(transformed_residuals), 100);
+y = pdf(pd, x);
+plot(x, y, 'r', 'LineWidth', 2);
+xlabel('Transformed Residual');
+ylabel('Probability Density');
+title(['Histogram of Transformed Residuals for RML channel ', num2str(rml_channel)]);
+legend('Transformed Residuals', 'Fitted Normal Distribution');
+hold off;
